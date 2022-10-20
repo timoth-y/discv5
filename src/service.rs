@@ -48,7 +48,7 @@ mod test;
 
 /// The number of distances (buckets) we simultaneously request from each peer.
 /// NOTE: This must not be larger than 127.
-pub(crate) const DISTANCES_TO_REQUEST_PER_PEER: usize = 3;
+pub(crate) const DISTANCES_TO_REQUEST_PER_PEER: usize = 10;
 
 /// Request type for Protocols using `TalkReq` message.
 ///

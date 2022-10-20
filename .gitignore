@@ -8,3 +8,5 @@ Cargo.lock
 
 # VIM swap files
 *.sw[op]
+
+.idea/

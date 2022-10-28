@@ -46,7 +46,7 @@ construct_uint! {
 #[derive(Clone, Debug)]
 pub struct Key<T> {
     preimage: T,
-    hash: GenericArray<u8, U32>,
+    pub hash: GenericArray<u8, U32>,
 }
 
 impl<T> PartialEq for Key<T> {

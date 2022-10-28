@@ -194,7 +194,7 @@ pub enum InsertResult<TNodeId> {
 /// A (type-safe) index into a `KBucketsTable`, i.e. a non-negative integer in the
 /// interval `[0, NUM_BUCKETS)`.
 #[derive(Copy, Clone)]
-struct BucketIndex(usize);
+pub struct BucketIndex(usize);
 
 impl BucketIndex {
     /// Creates a new `BucketIndex` for a `Distance`.
@@ -204,14 +204,14 @@ impl BucketIndex {
     /// recognition of the fact that the only key with distance `0` to a
     /// `local_key` is the `local_key` itself, which does not belong in any
     /// bucket.
-    fn new(d: &Distance) -> Option<BucketIndex> {
+    pub fn new(d: &Distance) -> Option<BucketIndex> {
         (NUM_BUCKETS - d.0.leading_zeros() as usize)
             .checked_sub(1)
             .map(BucketIndex)
     }
 
     /// Gets the index value as an unsigned integer.
-    fn get(self) -> usize {
+    pub fn get(self) -> usize {
         self.0
     }
 }

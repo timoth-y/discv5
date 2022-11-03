@@ -196,6 +196,7 @@ async fn main() {
                     Discv5Event::SessionEstablished(enr, _) => info!("Session established {}", enr),
                     Discv5Event::SocketUpdated(addr) => info!("Socket updated {}", addr),
                     Discv5Event::TalkRequest(_) => info!("Talk request received"),
+                    Discv5Event::FindValue(_) => info!("FindValue request received"),
                 };
             }
         }

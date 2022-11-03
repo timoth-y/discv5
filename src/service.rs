@@ -63,6 +63,60 @@ pub struct TalkRequest {
     sender: Option<mpsc::UnboundedSender<HandlerIn>>,
 }
 
+#[derive(Debug)]
+pub struct FindValueRequest {
+    id: RequestId,
+    node_address: NodeAddress,
+    nodes_responses: Vec<HandlerIn>,
+    key: NodeId,
+    sender: Option<mpsc::UnboundedSender<HandlerIn>>,
+}
+
+impl FindValueRequest {
+    pub fn id(&self) -> &RequestId {
+        &self.id
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_address.node_id
+    }
+
+    pub fn key(&self) -> &NodeId {
+        &self.key
+    }
+
+    pub fn respond(mut self, response: Option<Vec<u8>>) -> Result<(), ResponseError> {
+        match response {
+            Some(response) => {
+                let response = Response {
+                    id: self.id.clone(),
+                    body: ResponseBody::Value { response },
+                };
+
+                self.sender
+                    .take()
+                    .unwrap()
+                    .send(HandlerIn::Response(
+                        self.node_address.clone(),
+                        Box::new(response),
+                    ))
+                    .map_err(|_| ResponseError::ChannelClosed)?;
+            }
+            None => {
+                let sender = self.sender.take()
+                    .unwrap();
+                for resp in self.nodes_responses {
+                    sender
+                        .send(resp)
+                        .map_err(|_| ResponseError::ChannelClosed)?
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Drop for TalkRequest {
     fn drop(&mut self) {
         let sender = match self.sender.take() {
@@ -130,6 +184,11 @@ pub enum ServiceRequest {
     /// - A Predicate Query - Searches for peers closest to a random target that match a specified
     /// predicate.
     StartQuery(QueryKind, oneshot::Sender<Vec<Enr>>),
+    /// A request to start a query. There are two types of queries:
+    /// - A FindNode Query - Searches for peers using a random target.
+    /// - A Predicate Query - Searches for peers closest to a random target that match a specified
+    /// predicate.
+    FindValue(NodeId, mpsc::UnboundedSender<Result<Option<Vec<u8>>, RequestError>>),
     /// Find the ENR of a node given its multiaddr.
     FindEnr(NodeContact, oneshot::Sender<Result<Enr, RequestError>>),
     /// The TALK discv5 RPC function.
@@ -145,6 +204,7 @@ pub enum ServiceRequest {
 }
 
 use crate::discv5::PERMIT_BAN_LIST;
+use crate::service::query_info::{QueryCallback};
 
 pub struct Service {
     /// Configuration parameters.
@@ -212,6 +272,8 @@ pub enum CallbackResponse {
     Enr(oneshot::Sender<Result<Enr, RequestError>>),
     /// A response from a TALK request
     Talk(oneshot::Sender<Result<Vec<u8>, RequestError>>),
+    /// A response from a TALK request
+    Value(mpsc::UnboundedSender<Result<Option<Vec<u8>>, RequestError>>),
 }
 
 /// For multiple responses to a FindNodes request, this keeps track of the request count
@@ -322,6 +384,9 @@ impl Service {
                                 }
                             }
                         }
+                        ServiceRequest::FindValue(target_value, callback) => {
+                            self.start_findvalue_query(target_value, callback);
+                        }
                         ServiceRequest::FindEnr(node_contact, callback) => {
                             self.request_enr(node_contact, Some(callback));
                         }
@@ -403,8 +468,11 @@ impl Service {
                                     warn!("ENR not present in queries results");
                                 }
                             }
-                            if result.target.callback.send(found_enrs).is_err() {
-                                warn!("Callback dropped for query {}. Results dropped", *id);
+
+                            if let QueryCallback::FindNode(callback) = result.target.callback {
+                                if callback.send(found_enrs).is_err() {
+                                    warn!("Callback dropped for query {}. Results dropped", *id);
+                                }
                             }
                         }
                     }
@@ -434,7 +502,7 @@ impl Service {
             query_type: QueryType::FindNode(target_node),
             untrusted_enrs: Default::default(),
             distances_to_request: DISTANCES_TO_REQUEST_PER_PEER,
-            callback,
+            callback: QueryCallback::FindNode(callback),
         };
 
         let target_key: kbucket::Key<NodeId> = target.key();
@@ -451,8 +519,45 @@ impl Service {
 
         if known_closest_peers.is_empty() {
             warn!("No known_closest_peers found. Return empty result without sending query.");
-            if target.callback.send(vec![]).is_err() {
-                warn!("Failed to callback");
+            if let QueryCallback::FindNode(callback) = target.callback {
+                if callback.send(vec![]).is_err() {
+                    warn!("Failed to callback");
+                }
+            }
+        } else {
+            let query_config = FindNodeQueryConfig::new_from_config(&self.config);
+            self.queries
+                .add_findnode_query(query_config, target, known_closest_peers);
+        }
+    }
+
+    /// Internal function that starts a query.
+    fn start_findvalue_query(&mut self, target_value: NodeId, callback: mpsc::UnboundedSender<Result<Option<Vec<u8>>, RequestError>>) {
+        let mut target = QueryInfo {
+            query_type: QueryType::FindValue(target_value),
+            untrusted_enrs: Default::default(),
+            distances_to_request: DISTANCES_TO_REQUEST_PER_PEER,
+            callback: QueryCallback::FindValue(callback),
+        };
+
+        let target_key: kbucket::Key<NodeId> = target.key();
+        let mut known_closest_peers = Vec::new();
+        {
+            let mut kbuckets = self.kbuckets.write();
+            for closest in kbuckets.closest_values(&target_key) {
+                // Add the known ENR's to the untrusted list
+                target.untrusted_enrs.push(closest.value);
+                // Add the key to the list for the query
+                known_closest_peers.push(closest.key);
+            }
+        }
+
+        if known_closest_peers.is_empty() {
+            warn!("No known_closest_peers found. Return empty result without sending query.");
+            if let QueryCallback::FindValue(callback) = target.callback {
+                if callback.send(Ok(None)).is_err() {
+                    warn!("Failed to callback");
+                }
             }
         } else {
             let query_config = FindNodeQueryConfig::new_from_config(&self.config);
@@ -473,7 +578,7 @@ impl Service {
             query_type: QueryType::FindNode(target_node),
             untrusted_enrs: Default::default(),
             distances_to_request: DISTANCES_TO_REQUEST_PER_PEER,
-            callback,
+            callback: QueryCallback::FindNode(callback),
         };
 
         let target_key: kbucket::Key<NodeId> = target.key();
@@ -494,8 +599,10 @@ impl Service {
 
         if known_closest_peers.is_empty() {
             warn!("No known_closest_peers found. Return empty result without sending query.");
-            if target.callback.send(vec![]).is_err() {
-                warn!("Failed to callback");
+            if let QueryCallback::FindNode(callback) = target.callback {
+                if callback.send(vec![]).is_err() {
+                    warn!("Failed to callback");
+                }
             }
         } else {
             let mut query_config = PredicateQueryConfig::new_from_config(&self.config);
@@ -533,6 +640,18 @@ impl Service {
         match req.body {
             RequestBody::FindNode { distances } => {
                 self.send_nodes_response(node_address, id, distances);
+            }
+            RequestBody::FindValue { key, distances } => {
+                let nodes_responses = self.prepare_nodes_response(node_address.clone(), id.clone(), distances.clone());
+                let req = FindValueRequest {
+                    id,
+                    node_address,
+                    nodes_responses,
+                    key,
+                    sender: Some(self.handler_send.clone()),
+                };
+
+                self.send_event(Discv5Event::FindValue(req));
             }
             RequestBody::Ping { enr_seq } => {
                 // check if we need to update the known ENR
@@ -637,6 +756,12 @@ impl Service {
 
             match response.body {
                 ResponseBody::Nodes { total, mut nodes } => {
+                    if let Some(CallbackResponse::Value(ref callback)) = active_request.callback {
+                        if callback.is_closed() {
+                            return;
+                        }
+                    }
+
                     // Currently a maximum of DISTANCES_TO_REQUEST_PER_PEER*BUCKET_SIZE peers can be returned. Datagrams have a max
                     // size of 1280 and ENR's have a max size of 300 bytes.
                     //
@@ -651,6 +776,7 @@ impl Service {
                     // These are sanitized and ordered
                     let distances_requested = match &active_request.request_body {
                         RequestBody::FindNode { distances } => distances,
+                        RequestBody::FindValue {distances, ..} => distances,
                         _ => unreachable!(),
                     };
 
@@ -763,6 +889,19 @@ impl Service {
                     self.active_nodes_responses.remove(&node_id);
 
                     self.discovered(&node_id, nodes, active_request.query_id);
+                }
+                ResponseBody::Value { response } => {
+                    // Send the response to the user
+                    match active_request.callback {
+                        Some(CallbackResponse::Value(callback)) => {
+                            if let Err(e) = callback.send(Ok(Some(response))) {
+                                warn!("Failed to send callback response {:?}", e)
+                            };
+
+                            self.queries.get_mut(active_request.query_id.unwrap()).unwrap().mark_as_found();
+                        }
+                        _ => error!("Invalid callback for response"),
+                    }
                 }
                 ResponseBody::Pong { enr_seq, ip, port } => {
                     let socket = SocketAddr::new(ip, port);
@@ -1093,6 +1232,114 @@ impl Service {
         }
     }
 
+    /// Sends a NODES response, given a list of found ENR's. This function splits the nodes up
+    /// into multiple responses to ensure the response stays below the maximum packet size.
+    fn prepare_nodes_response(
+        &mut self,
+        node_address: NodeAddress,
+        rpc_id: RequestId,
+        mut distances: Vec<u64>,
+    ) -> Vec<HandlerIn>{
+        // NOTE: At most we only allow 5 distances to be sent (see the decoder). If each of these
+        // buckets are full, that equates to 80 ENR's to respond with.
+
+        let mut nodes_to_send = Vec::new();
+        distances.sort_unstable();
+        distances.dedup();
+
+        if let Some(0) = distances.first() {
+            // if the distance is 0 send our local ENR
+            nodes_to_send.push(self.local_enr.read().clone());
+            debug!("Sending our ENR to node: {}", node_address);
+            distances.remove(0);
+        }
+
+        if !distances.is_empty() {
+            let mut kbuckets = self.kbuckets.write();
+            for node in kbuckets
+                .nodes_by_distances(distances.as_slice(), self.config.max_nodes_response)
+                .into_iter()
+                .filter_map(|entry| {
+                    if entry.node.key.preimage() != &node_address.node_id {
+                        Some(entry.node.value.clone())
+                    } else {
+                        None
+                    }
+                })
+            {
+                nodes_to_send.push(node);
+            }
+        }
+
+        // if there are no nodes, send an empty response
+        if nodes_to_send.is_empty() {
+            let response = Response {
+                id: rpc_id,
+                body: ResponseBody::Nodes {
+                    total: 1u64,
+                    nodes: Vec::new(),
+                },
+            };
+            trace!(
+                "Sending empty FINDNODES response to: {}",
+                node_address.node_id
+            );
+            return vec![HandlerIn::Response(node_address, Box::new(response))]
+        } else {
+            // build the NODES response
+            let mut to_send_nodes: Vec<Vec<Enr>> = Vec::new();
+            let mut total_size = 0;
+            let mut rpc_index = 0;
+            to_send_nodes.push(Vec::new());
+            for enr in nodes_to_send.into_iter() {
+                let entry_size = rlp::encode(&enr).len();
+                // Responses assume that a session is established. Thus, on top of the encoded
+                // ENR's the packet should be a regular message. A regular message has an IV (16
+                // bytes), and a header of 55 bytes. The find-nodes RPC requires 16 bytes for the ID and the
+                // `total` field. Also there is a 16 byte HMAC for encryption and an extra byte for
+                // RLP encoding.
+                //
+                // We could also be responding via an autheader which can take up to 282 bytes in its
+                // header.
+                // As most messages will be normal messages we will try and pack as many ENR's we
+                // can in and drop the response packet if a user requests an auth message of a very
+                // packed response.
+                //
+                // The estimated total overhead for a regular message is therefore 104 bytes.
+                if entry_size + total_size < MAX_PACKET_SIZE - 104 {
+                    total_size += entry_size;
+                    trace!(
+                        "Adding ENR {}, size {}, total size {}",
+                        enr,
+                        entry_size,
+                        total_size
+                    );
+                    to_send_nodes[rpc_index].push(enr);
+                } else {
+                    total_size = entry_size;
+                    to_send_nodes.push(vec![enr]);
+                    rpc_index += 1;
+                }
+            }
+
+            let responses: Vec<Response> = to_send_nodes
+                .into_iter()
+                .map(|nodes| Response {
+                    id: rpc_id.clone(),
+                    body: ResponseBody::Nodes {
+                        total: (rpc_index + 1) as u64,
+                        nodes,
+                    },
+                })
+                .collect();
+
+            responses.into_iter().map(|response| HandlerIn::Response(
+                node_address.clone(),
+                Box::new(response),
+            )).collect()
+        }
+    }
+
     /// Constructs and sends a request RPC to the session service given a `QueryInfo`.
     fn send_rpc_query(
         &mut self,
@@ -1102,13 +1349,22 @@ impl Service {
     ) {
         // find the ENR associated with the query
         if let Some(enr) = self.find_enr(&return_peer) {
+            let mut callback = None;
+            if matches!(request_body, RequestBody::FindValue {..}) {
+                let q = self.queries.get_mut(query_id.clone()).unwrap();
+
+                if let QueryCallback::FindValue(ref mut c) = &mut q.target_mut().callback {
+                    let _ = callback.insert(CallbackResponse::Value(c.clone()));
+                }
+            }
+
             match NodeContact::try_from_enr(enr, self.config.ip_mode) {
                 Ok(contact) => {
                     let active_request = ActiveRequest {
                         contact,
                         request_body,
                         query_id: Some(query_id),
-                        callback: None,
+                        callback,
                     };
                     self.send_rpc_request(active_request);
                     // Request successfully sent
@@ -1383,6 +1639,13 @@ impl Service {
                     callback
                         .send(Err(error))
                         .unwrap_or_else(|_| debug!("Couldn't send TALK error response to user"));
+                    return;
+                }
+                Some(CallbackResponse::Value(callback)) => {
+                    // return the error
+                    callback
+                        .send(Err(error))
+                        .unwrap_or_else(|_| debug!("Couldn't send VALUE error response to user"));
                     return;
                 }
                 None => {

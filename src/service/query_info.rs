@@ -1,7 +1,7 @@
-use crate::{kbucket::Key, rpc::RequestBody, Enr};
+use crate::{kbucket::Key, rpc::RequestBody, Enr, RequestError};
 use enr::{k256::sha2::digest::generic_array::GenericArray, NodeId};
 use smallvec::SmallVec;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// Information about a query.
 #[derive(Debug)]
@@ -13,7 +13,7 @@ pub struct QueryInfo {
     pub untrusted_enrs: SmallVec<[Enr; 16]>,
 
     /// A callback channel for the service that requested the query.
-    pub callback: oneshot::Sender<Vec<Enr>>,
+    pub callback: QueryCallback,
 
     /// The number of distances we request for each peer.
     /// NOTE: This must not be larger than 127.
@@ -25,6 +25,15 @@ pub struct QueryInfo {
 pub enum QueryType {
     /// The user requested a `FIND_NODE` query to be performed. It should be reported when finished.
     FindNode(NodeId),
+    /// The user requested a `FIND_NODE` query to be performed. It should be reported when finished.
+    FindValue(NodeId),
+}
+
+/// Additional information about the query.
+#[derive(Debug)]
+pub enum QueryCallback {
+    FindNode(oneshot::Sender<Vec<Enr>>),
+    FindValue(mpsc::UnboundedSender<Result<Option<Vec<u8>>, RequestError>>),
 }
 
 impl QueryInfo {
@@ -36,6 +45,11 @@ impl QueryInfo {
                     .unwrap_or_else(|| vec![0]);
                 RequestBody::FindNode { distances }
             }
+            QueryType::FindValue(key) => {
+                let distances = findnode_log2distance(key, peer, self.distances_to_request)
+                    .unwrap_or_else(|| vec![0]);
+                RequestBody::FindValue { key, distances }
+            }
         }
     }
 }
@@ -45,6 +59,9 @@ impl crate::query_pool::TargetKey<NodeId> for QueryInfo {
         match self.query_type {
             QueryType::FindNode(ref node_id) => {
                 Key::new_raw(*node_id, *GenericArray::from_slice(&node_id.raw()))
+            }
+            QueryType::FindValue(ref key) => {
+                Key::new_raw(*key, *GenericArray::from_slice(&key.raw()))
             }
         }
     }

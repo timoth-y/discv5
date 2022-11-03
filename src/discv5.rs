@@ -30,7 +30,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use futures::channel::mpsc::UnboundedSender;
+use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tracing::{debug, warn};
 
 #[cfg(feature = "libp2p")]
@@ -38,6 +41,7 @@ use libp2p_core::Multiaddr;
 
 // Create lazy static variable for the global permit/ban list
 use crate::metrics::{Metrics, METRICS};
+use crate::service::FindValueRequest;
 lazy_static! {
     pub static ref PERMIT_BAN_LIST: RwLock<crate::PermitBanList> =
         RwLock::new(crate::PermitBanList::default());
@@ -67,6 +71,8 @@ pub enum Discv5Event {
     SocketUpdated(SocketAddr),
     /// A node has initiated a talk request.
     TalkRequest(TalkRequest),
+    /// A node has initiated a FIND_VALUE request.
+    FindValue(FindValueRequest),
 }
 
 /// The main Discv5 Service struct. This provides the user-level API for performing queries and
@@ -523,6 +529,34 @@ impl Discv5 {
                 .await
                 .map_err(|e| QueryError::ChannelFailed(e.to_string()))
         }
+    }
+
+    /// Runs an iterative `FIND_VALUE` request.
+    ///
+    /// This will return peers containing contactable nodes of the DHT closest to the
+    /// requested `NodeId`.
+    ///
+    /// Note: The async syntax is forgone here in order to create `'static` futures, where the
+    /// underlying sending channel is cloned.
+    pub async fn find_value(
+        &self,
+        target_value: NodeId,
+    ) -> Result<Option<Vec<u8>>, RequestError> {
+        let channel = self.clone_channel();
+
+        let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
+        let (callback_send, callback_recv) = mpsc::unbounded_channel();
+
+        let event = ServiceRequest::FindValue(target_value, callback_send);
+        channel
+            .send(event)
+            .await
+            .map_err(|_| RequestError::ChannelFailed("Service channel closed".into()))?;
+
+        UnboundedReceiverStream::new(callback_recv).next()
+            .await
+            .unwrap()
+            .map_err(|e| RequestError::ChannelFailed(e.to_string()))
     }
 
     /// Starts a `FIND_NODE` request.

@@ -1,4 +1,5 @@
-use enr::{CombinedKey, Enr};
+use std::convert::TryInto;
+use enr::{CombinedKey, Enr, NodeId};
 use rlp::{DecoderError, RlpStream};
 use std::net::{IpAddr, Ipv6Addr};
 use tracing::{debug, warn};
@@ -73,6 +74,12 @@ pub enum RequestBody {
         /// The distance(s) of peers we expect to be returned in the response.
         distances: Vec<u64>,
     },
+    /// A FINDNODE request.
+    FindValue {
+        key: NodeId,
+        /// The distance(s) of peers we expect to be returned in the response.
+        distances: Vec<u64>,
+    },
     /// A Talk request.
     Talk {
         /// The protocol requesting.
@@ -120,6 +127,9 @@ pub enum ResponseBody {
     RegisterConfirmation {
         topic: Vec<u8>,
     },
+    Value {
+        response: Vec<u8>,
+    }
 }
 
 impl Request {
@@ -130,6 +140,7 @@ impl Request {
             RequestBody::Talk { .. } => 5,
             RequestBody::RegisterTopic { .. } => 7,
             RequestBody::TopicQuery { .. } => 10,
+            RequestBody::FindValue { .. } => 11
         }
     }
 
@@ -186,6 +197,18 @@ impl Request {
                 buf.extend_from_slice(&s.out());
                 buf
             }
+            RequestBody::FindValue { key, distances } => {
+                let mut s = RlpStream::new();
+                s.begin_list(3);
+                s.append(&id.as_bytes());
+                s.append(&key.raw().to_vec());
+                s.begin_list(distances.len());
+                for distance in distances {
+                    s.append(&distance);
+                }
+                buf.extend_from_slice(&s.out());
+                buf
+            }
         }
     }
 }
@@ -198,6 +221,7 @@ impl Response {
             ResponseBody::Talk { .. } => 6,
             ResponseBody::Ticket { .. } => 8,
             ResponseBody::RegisterConfirmation { .. } => 9,
+            ResponseBody::Value { .. } => 12
         }
     }
 
@@ -208,7 +232,7 @@ impl Response {
             ResponseBody::Nodes { .. } => {
                 matches!(
                     req,
-                    RequestBody::FindNode { .. } | RequestBody::TopicQuery { .. }
+                    RequestBody::FindNode { .. } | RequestBody::TopicQuery { .. } | RequestBody::FindValue { .. }
                 )
             }
             ResponseBody::Talk { .. } => matches!(req, RequestBody::Talk { .. }),
@@ -216,6 +240,7 @@ impl Response {
             ResponseBody::RegisterConfirmation { .. } => {
                 matches!(req, RequestBody::RegisterTopic { .. })
             }
+            ResponseBody::Value { .. } => matches!(req, RequestBody::FindValue { .. }),
         }
     }
 
@@ -281,6 +306,14 @@ impl Response {
                 buf.extend_from_slice(&s.out());
                 buf
             }
+            ResponseBody::Value { response } => {
+                let mut s = RlpStream::new();
+                s.begin_list(2);
+                s.append(&id.as_bytes());
+                s.append(&response);
+                buf.extend_from_slice(&s.out());
+                buf
+            }
         }
     }
 }
@@ -337,6 +370,9 @@ impl std::fmt::Display for ResponseBody {
             ResponseBody::RegisterConfirmation { topic } => {
                 write!(f, "REGTOPIC: Registered: {}", hex::encode(topic))
             }
+            ResponseBody::Value { response } => {
+                write!(f, "Response: Response {}", hex::encode(response))
+            }
         }
     }
 }
@@ -367,6 +403,11 @@ impl std::fmt::Display for RequestBody {
                 hex::encode(topic),
                 enr.to_base64(),
                 hex::encode(ticket)
+            ),
+            RequestBody::FindValue { key, .. } => write!(
+                f,
+                "FIND_VALUE: key: {}",
+                hex::encode(key.raw()),
             ),
         }
     }
@@ -547,6 +588,64 @@ impl Message {
                 Message::Response(Response {
                     id,
                     body: ResponseBody::Talk { response },
+                })
+            }
+            11 => {
+                // Find Value
+                if list_len != 3 {
+                    debug!(
+                        "FindValue Request has an invalid RLP list length. Expected 3 found {}",
+                        list_len
+                    );
+                    return Err(DecoderError::RlpIncorrectListLen);
+                }
+                let key = rlp.val_at::<Vec<u8>>(1)?;
+
+                if key.len() != 32 {
+                    warn!(
+                        "Rejected FindValue request asking with invalid key size {}",
+                        key.len()
+                    );
+                    return Err(DecoderError::Custom("FINDVALUE request too large"));
+                }
+
+                let distances = rlp.list_at::<u64>(2)?;
+
+                if distances.len() > 10 {
+                    warn!(
+                        "Rejected FindValue request asking for too many buckets {}, maximum 10",
+                        distances.len()
+                    );
+                    return Err(DecoderError::Custom("FINDVALUE request too large"));
+                }
+                for distance in distances.iter() {
+                    if distance > &256u64 {
+                        warn!(
+                            "Rejected FindValue request asking for unknown distance {}, maximum 256",
+                            distance
+                        );
+                        return Err(DecoderError::Custom("FINDVALUE request distance invalid"));
+                    }
+                }
+
+                Message::Request(Request {
+                    id,
+                    body: RequestBody::FindValue { key: NodeId::new(key.as_slice().try_into().unwrap()), distances },
+                })
+            }
+            12 => {
+                // Value Response
+                if list_len != 2 {
+                    debug!(
+                        "Value Response has an invalid RLP list length. Expected 2, found {}",
+                        list_len
+                    );
+                    return Err(DecoderError::RlpIncorrectListLen);
+                }
+                let response = rlp.val_at::<Vec<u8>>(1)?;
+                Message::Response(Response {
+                    id,
+                    body: ResponseBody::Value { response },
                 })
             }
             _ => {

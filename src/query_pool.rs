@@ -201,6 +201,8 @@ pub struct Query<TTarget, TNodeId, TResult> {
     started: Option<Instant>,
     /// Target we are looking for.
     target: TTarget,
+
+    found_value: bool,
 }
 
 /// The peer selection strategies that can be used by queries.
@@ -222,6 +224,7 @@ where
             peer_iter,
             target,
             started: None,
+            found_value: false
         }
     }
 
@@ -255,6 +258,10 @@ where
 
     /// Advances the state of the underlying peer iterator.
     fn next(&mut self, now: Instant) -> QueryState<TNodeId> {
+        if self.found_value {
+            return QueryState::Finished
+        }
+
         match &mut self.peer_iter {
             QueryPeerIter::FindNode(iter) => iter.next(now),
             QueryPeerIter::Predicate(iter) => iter.next(now),
@@ -281,6 +288,10 @@ where
     /// Returns a mutable reference to the query `target`.
     pub fn target_mut(&mut self) -> &mut TTarget {
         &mut self.target
+    }
+
+    pub fn mark_as_found(&mut self) {
+        self.found_value = true
     }
 }
 

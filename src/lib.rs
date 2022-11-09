@@ -104,7 +104,7 @@
 
 mod config;
 mod discv5;
-mod error;
+pub mod error;
 mod executor;
 pub mod handler;
 mod ipmode;

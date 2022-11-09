@@ -48,7 +48,7 @@ mod test;
 
 /// The number of distances (buckets) we simultaneously request from each peer.
 /// NOTE: This must not be larger than 127.
-pub(crate) const DISTANCES_TO_REQUEST_PER_PEER: usize = 10;
+pub(crate) const DISTANCES_TO_REQUEST_PER_PEER: usize = 3;
 
 /// Request type for Protocols using `TalkReq` message.
 ///
@@ -188,7 +188,7 @@ pub enum ServiceRequest {
     /// - A FindNode Query - Searches for peers using a random target.
     /// - A Predicate Query - Searches for peers closest to a random target that match a specified
     /// predicate.
-    FindValue(NodeId, mpsc::UnboundedSender<Result<Option<Vec<u8>>, RequestError>>),
+    FindValue(NodeId, mpsc::UnboundedSender<Result<Vec<u8>, FindValueError>>),
     /// Find the ENR of a node given its multiaddr.
     FindEnr(NodeContact, oneshot::Sender<Result<Enr, RequestError>>),
     /// The TALK discv5 RPC function.
@@ -204,6 +204,7 @@ pub enum ServiceRequest {
 }
 
 use crate::discv5::PERMIT_BAN_LIST;
+use crate::error::FindValueError;
 use crate::service::query_info::{QueryCallback};
 
 pub struct Service {
@@ -273,7 +274,7 @@ pub enum CallbackResponse {
     /// A response from a TALK request
     Talk(oneshot::Sender<Result<Vec<u8>, RequestError>>),
     /// A response from a TALK request
-    Value(mpsc::UnboundedSender<Result<Option<Vec<u8>>, RequestError>>),
+    Value(mpsc::UnboundedSender<Result<Vec<u8>, FindValueError>>),
 }
 
 /// For multiple responses to a FindNodes request, this keeps track of the request count
@@ -469,10 +470,17 @@ impl Service {
                                 }
                             }
 
-                            if let QueryCallback::FindNode(callback) = result.target.callback {
-                                if callback.send(found_enrs).is_err() {
-                                    warn!("Callback dropped for query {}. Results dropped", *id);
-                                }
+                            match result.target.callback {
+                                QueryCallback::FindNode(callback) => {
+                                    if callback.send(found_enrs).is_err() {
+                                        warn!("Callback dropped for query {}. Results dropped", *id);
+                                    }
+                                },
+                                QueryCallback::FindValue(callback) => {
+                                    if callback.send(Err(FindValueError::RequestErrorWithEnrs((RequestError::Timeout, found_enrs)))).is_err() {
+                                        warn!("Callback dropped for query {}. Results dropped", *id);
+                                    }
+                                },
                             }
                         }
                     }
@@ -532,7 +540,7 @@ impl Service {
     }
 
     /// Internal function that starts a query.
-    fn start_findvalue_query(&mut self, target_value: NodeId, callback: mpsc::UnboundedSender<Result<Option<Vec<u8>>, RequestError>>) {
+    fn start_findvalue_query(&mut self, target_value: NodeId, callback: mpsc::UnboundedSender<Result<Vec<u8>, FindValueError>>) {
         let mut target = QueryInfo {
             query_type: QueryType::FindValue(target_value),
             untrusted_enrs: Default::default(),
@@ -555,14 +563,14 @@ impl Service {
         if known_closest_peers.is_empty() {
             warn!("No known_closest_peers found. Return empty result without sending query.");
             if let QueryCallback::FindValue(callback) = target.callback {
-                if callback.send(Ok(None)).is_err() {
+                if callback.send(Err(FindValueError::RequestErrorWithEnrs((RequestError::Timeout, vec![])))).is_err() {
                     warn!("Failed to callback");
                 }
             }
         } else {
             let query_config = FindNodeQueryConfig::new_from_config(&self.config);
             self.queries
-                .add_findnode_query(query_config, target, known_closest_peers);
+                .add_findvalue_query(query_config, target, known_closest_peers);
         }
     }
 
@@ -776,7 +784,7 @@ impl Service {
                     // These are sanitized and ordered
                     let distances_requested = match &active_request.request_body {
                         RequestBody::FindNode { distances } => distances,
-                        RequestBody::FindValue {distances, ..} => distances,
+                        RequestBody::FindValue { distances, ..} => distances,
                         _ => unreachable!(),
                     };
 
@@ -894,11 +902,14 @@ impl Service {
                     // Send the response to the user
                     match active_request.callback {
                         Some(CallbackResponse::Value(callback)) => {
-                            if let Err(e) = callback.send(Ok(Some(response))) {
+                            if let Err(e) = callback.send(Ok(response)) {
                                 warn!("Failed to send callback response {:?}", e)
                             };
 
-                            self.queries.get_mut(active_request.query_id.unwrap()).unwrap().mark_as_found();
+                            if let Some(q) = self.queries.get_mut(active_request.query_id.unwrap()) {
+                                q.mark_as_found();
+                                self.discovered(&node_id, vec![], active_request.query_id);
+                            }
                         }
                         _ => error!("Invalid callback for response"),
                     }
@@ -1397,7 +1408,7 @@ impl Service {
         };
         let contact = active_request.contact.clone();
 
-        debug!("Sending RPC {} to node: {}", request, contact);
+        debug!("Sending RPC id={} to node: {}", id, contact.node_id());
         if self
             .handler_send
             .send(HandlerIn::Request(contact, Box::new(request)))
@@ -1644,7 +1655,7 @@ impl Service {
                 Some(CallbackResponse::Value(callback)) => {
                     // return the error
                     callback
-                        .send(Err(error))
+                        .send(Err(FindValueError::RequestError(error)))
                         .unwrap_or_else(|_| debug!("Couldn't send VALUE error response to user"));
                     return;
                 }

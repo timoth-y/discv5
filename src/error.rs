@@ -1,4 +1,4 @@
-use crate::{handler::Challenge, node_info::NonContactable};
+use crate::{Enr, handler::Challenge, node_info::NonContactable};
 use rlp::DecoderError;
 use std::fmt;
 
@@ -87,6 +87,13 @@ impl fmt::Display for ResponseError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindValueError  {
+    /// The request timed out.
+    RequestError(RequestError),
+    RequestErrorWithEnrs((RequestError, Vec<Enr>)),
+}
+
 impl std::error::Error for ResponseError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +147,12 @@ impl fmt::Display for RequestError {
 }
 
 impl fmt::Display for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl fmt::Display for FindValueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
     }

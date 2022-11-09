@@ -2,6 +2,7 @@ use crate::{kbucket::Key, rpc::RequestBody, Enr, RequestError};
 use enr::{k256::sha2::digest::generic_array::GenericArray, NodeId};
 use smallvec::SmallVec;
 use tokio::sync::{mpsc, oneshot};
+use crate::error::FindValueError;
 
 /// Information about a query.
 #[derive(Debug)]
@@ -33,7 +34,7 @@ pub enum QueryType {
 #[derive(Debug)]
 pub enum QueryCallback {
     FindNode(oneshot::Sender<Vec<Enr>>),
-    FindValue(mpsc::UnboundedSender<Result<Option<Vec<u8>>, RequestError>>),
+    FindValue(mpsc::UnboundedSender<Result<Vec<u8>, FindValueError>>),
 }
 
 impl QueryInfo {

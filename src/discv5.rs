@@ -13,7 +13,7 @@
 //! The server can be shutdown using the [`Discv5::shutdown`] function.
 
 use crate::{
-    error::{Discv5Error, QueryError, RequestError},
+    error::{Discv5Error, QueryError, RequestError, FindValueError},
     kbucket::{
         self, ConnectionDirection, ConnectionState, FailureReason, InsertResult, KBucketsTable,
         NodeStatus, UpdateResult,
@@ -538,25 +538,27 @@ impl Discv5 {
     ///
     /// Note: The async syntax is forgone here in order to create `'static` futures, where the
     /// underlying sending channel is cloned.
-    pub async fn find_value(
+    pub fn find_value(
         &self,
         target_value: NodeId,
-    ) -> Result<Option<Vec<u8>>, RequestError> {
+    ) -> impl Future<Output = Result<Vec<u8>, FindValueError>> + 'static {
         let channel = self.clone_channel();
 
-        let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
-        let (callback_send, callback_recv) = mpsc::unbounded_channel();
+        async move {
+            let channel = channel.map_err(|_| FindValueError::RequestError(RequestError::ServiceNotStarted))?;
+            let (callback_send, callback_recv) = mpsc::unbounded_channel();
 
-        let event = ServiceRequest::FindValue(target_value, callback_send);
-        channel
-            .send(event)
-            .await
-            .map_err(|_| RequestError::ChannelFailed("Service channel closed".into()))?;
+            let event = ServiceRequest::FindValue(target_value, callback_send);
+            channel
+                .send(event)
+                .await
+                .map_err(|_| FindValueError::RequestError(RequestError::ChannelFailed("Service channel closed".into())))?;
 
-        UnboundedReceiverStream::new(callback_recv).next()
-            .await
-            .unwrap()
-            .map_err(|e| RequestError::ChannelFailed(e.to_string()))
+            UnboundedReceiverStream::new(callback_recv).next()
+                .await
+                .or(Some(Err(FindValueError::RequestError(RequestError::ChannelFailed("Unknown reason".to_string())))))
+                .unwrap()
+        }
     }
 
     /// Starts a `FIND_NODE` request.

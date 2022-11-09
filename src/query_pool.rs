@@ -23,6 +23,7 @@
 
 mod peers;
 
+use std::fmt::Debug;
 pub use peers::QueryState;
 pub(crate) use peers::{
     closest::{FindNodeQuery, FindNodeQueryConfig},
@@ -65,7 +66,7 @@ pub enum QueryPoolState<'a, TTarget, TNodeId, TResult> {
 impl<TTarget, TNodeId, TResult> QueryPool<TTarget, TNodeId, TResult>
 where
     TTarget: TargetKey<TNodeId>,
-    TNodeId: Into<Key<TNodeId>> + Eq + Clone,
+    TNodeId: Into<Key<TNodeId>> + Eq + Clone + Debug,
     TResult: Into<TNodeId> + Clone,
 {
     /// Creates a new `QueryPool` with the given configuration.
@@ -95,6 +96,22 @@ where
         let target_key = target.key();
         let findnode_query = FindNodeQuery::with_config(config, target_key, peers);
         let peer_iter = QueryPeerIter::FindNode(findnode_query);
+        self.add(peer_iter, target)
+    }
+
+    /// Adds a query to the pool that iterates towards the closest peers to the target.
+    pub fn add_findvalue_query<I>(
+        &mut self,
+        config: FindNodeQueryConfig,
+        target: TTarget,
+        peers: I,
+    ) -> QueryId
+        where
+            I: IntoIterator<Item = Key<TNodeId>>,
+    {
+        let target_key = target.key();
+        let findnode_query = FindNodeQuery::with_config(config, target_key, peers);
+        let peer_iter = QueryPeerIter::FindValue(findnode_query);
         self.add(peer_iter, target)
     }
 
@@ -207,6 +224,7 @@ pub struct Query<TTarget, TNodeId, TResult> {
 
 /// The peer selection strategies that can be used by queries.
 enum QueryPeerIter<TNodeId, TResult> {
+    FindValue(FindNodeQuery<TNodeId>),
     FindNode(FindNodeQuery<TNodeId>),
     Predicate(PredicateQuery<TNodeId, TResult>),
 }
@@ -214,7 +232,7 @@ enum QueryPeerIter<TNodeId, TResult> {
 impl<TTarget, TNodeId, TResult> Query<TTarget, TNodeId, TResult>
 where
     TTarget: TargetKey<TNodeId>,
-    TNodeId: Into<Key<TNodeId>> + Eq + Clone,
+    TNodeId: Into<Key<TNodeId>> + Eq + Clone + Debug,
     TResult: Into<TNodeId> + Clone,
 {
     /// Creates a new query without starting it.
@@ -238,6 +256,7 @@ where
         match &mut self.peer_iter {
             QueryPeerIter::FindNode(iter) => iter.on_failure(peer),
             QueryPeerIter::Predicate(iter) => iter.on_failure(peer),
+            QueryPeerIter::FindValue(iter) => iter.on_failure(peer),
         }
     }
 
@@ -250,6 +269,9 @@ where
     {
         match &mut self.peer_iter {
             QueryPeerIter::FindNode(iter) => {
+                iter.on_success(peer, new_peers.iter().map(|result| result.into()).collect())
+            }
+            QueryPeerIter::FindValue(iter) => {
                 iter.on_success(peer, new_peers.iter().map(|result| result.into()).collect())
             }
             QueryPeerIter::Predicate(iter) => iter.on_success(peer, new_peers),
@@ -265,6 +287,18 @@ where
         match &mut self.peer_iter {
             QueryPeerIter::FindNode(iter) => iter.next(now),
             QueryPeerIter::Predicate(iter) => iter.next(now),
+            QueryPeerIter::FindValue(iter) => {
+                if self.found_value {
+                    return QueryState::Finished
+                }
+
+                match iter.next(now) {
+                    QueryState::Finished => {
+                        QueryState::WaitingAtCapacity
+                    },
+                    s => s
+                }
+            }
         }
     }
 
@@ -273,6 +307,7 @@ where
         let peers = match self.peer_iter {
             QueryPeerIter::FindNode(iter) => iter.into_result(),
             QueryPeerIter::Predicate(iter) => iter.into_result(),
+            QueryPeerIter::FindValue(iter) => iter.into_result(),
         };
         QueryResult {
             target: self.target,

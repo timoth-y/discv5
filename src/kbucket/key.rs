@@ -113,6 +113,17 @@ impl From<NodeId> for Key<NodeId> {
 #[derive(Copy, Clone, PartialEq, Eq, Default, PartialOrd, Ord, Debug)]
 pub struct Distance(pub(super) U256);
 
+impl Distance {
+    pub fn as_log2_distance(&self) -> Option<u64> {
+        let log_dist = u64::from(256 - self.0.leading_zeros());
+        if log_dist == 0 {
+            None
+        } else {
+            Some(log_dist)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
